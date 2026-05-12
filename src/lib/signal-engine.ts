@@ -1,4 +1,5 @@
-// Pro signal engine: multi-indicator confluence (EMA, RSI, MACD, BB, ATR)
+// Pro multi-timeframe confluence engine.
+// Stable signals: only flip when confluence strongly reverses; otherwise hold.
 export type Candle = { openTime: number; open: number; high: number; low: number; close: number; volume: number };
 export type SignalSide = "BUY" | "SELL" | "NEUTRAL";
 
@@ -9,17 +10,20 @@ export interface Signal {
   takeProfit1: number;
   takeProfit2: number;
   takeProfit3: number;
-  confidence: number; // 0-100
+  confidence: number;
   rr: number;
   reasons: string[];
   rsi: number;
   trend: "BULLISH" | "BEARISH" | "RANGING";
+  htfTrend: "BULLISH" | "BEARISH" | "RANGING";
   atr: number;
   validUntil: number;
   generatedAt: number;
+  bullScore: number;
+  bearScore: number;
 }
 
-const ema = (values: number[], period: number): number[] => {
+const emaArr = (values: number[], period: number): number[] => {
   const k = 2 / (period + 1);
   const out: number[] = [];
   let prev = values[0];
@@ -29,21 +33,27 @@ const ema = (values: number[], period: number): number[] => {
   }
   return out;
 };
+const last = <T,>(a: T[]) => a[a.length - 1];
 
-const rsi = (closes: number[], period = 14): number => {
+const rsiCalc = (closes: number[], period = 14): number => {
   if (closes.length < period + 1) return 50;
   let gains = 0, losses = 0;
-  for (let i = closes.length - period; i < closes.length; i++) {
-    const diff = closes[i] - closes[i - 1];
-    if (diff >= 0) gains += diff; else losses -= diff;
+  for (let i = 1; i <= period; i++) {
+    const d = closes[i] - closes[i - 1];
+    d >= 0 ? (gains += d) : (losses -= d);
   }
-  const avgG = gains / period, avgL = losses / period;
+  let avgG = gains / period, avgL = losses / period;
+  for (let i = period + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    const g = d >= 0 ? d : 0, l = d < 0 ? -d : 0;
+    avgG = (avgG * (period - 1) + g) / period;
+    avgL = (avgL * (period - 1) + l) / period;
+  }
   if (avgL === 0) return 100;
-  const rs = avgG / avgL;
-  return 100 - 100 / (1 + rs);
+  return 100 - 100 / (1 + avgG / avgL);
 };
 
-const atr = (candles: Candle[], period = 14): number => {
+const atrCalc = (candles: Candle[], period = 14): number => {
   const trs: number[] = [];
   for (let i = 1; i < candles.length; i++) {
     const c = candles[i], p = candles[i - 1];
@@ -53,95 +63,124 @@ const atr = (candles: Candle[], period = 14): number => {
   return slice.reduce((a, b) => a + b, 0) / slice.length;
 };
 
-const macd = (closes: number[]) => {
-  const e12 = ema(closes, 12);
-  const e26 = ema(closes, 26);
+const macdCalc = (closes: number[]) => {
+  const e12 = emaArr(closes, 12);
+  const e26 = emaArr(closes, 26);
   const line = e12.map((v, i) => v - e26[i]);
-  const signal = ema(line, 9);
-  const hist = line[line.length - 1] - signal[signal.length - 1];
-  return { hist, line: line[line.length - 1], signal: signal[signal.length - 1] };
+  const sig = emaArr(line, 9);
+  return { line: last(line), signal: last(sig), hist: last(line) - last(sig), prevHist: line[line.length-2] - sig[sig.length-2] };
 };
 
-const bollinger = (closes: number[], period = 20, mult = 2) => {
+const boll = (closes: number[], period = 20, mult = 2) => {
   const slice = closes.slice(-period);
   const mean = slice.reduce((a, b) => a + b, 0) / period;
-  const variance = slice.reduce((a, b) => a + (b - mean) ** 2, 0) / period;
-  const sd = Math.sqrt(variance);
-  return { mid: mean, upper: mean + mult * sd, lower: mean - mult * sd };
+  const sd = Math.sqrt(slice.reduce((a, b) => a + (b - mean) ** 2, 0) / period);
+  return { mid: mean, upper: mean + mult * sd, lower: mean - mult * sd, width: (mult * 2 * sd) / mean };
 };
 
-export function generateSignal(candles: Candle[], livePrice: number): Signal {
-  const closes = candles.map((c) => c.close);
-  const ema9 = ema(closes, 9);
-  const ema21 = ema(closes, 21);
-  const ema50 = ema(closes, 50);
-  const r = rsi(closes);
-  const m = macd(closes);
-  const bb = bollinger(closes);
-  const a = atr(candles);
+function trendOf(closes: number[]): "BULLISH" | "BEARISH" | "RANGING" {
+  const e9 = last(emaArr(closes, 9));
+  const e21 = last(emaArr(closes, 21));
+  const e50 = last(emaArr(closes, 50));
+  if (e9 > e21 && e21 > e50) return "BULLISH";
+  if (e9 < e21 && e21 < e50) return "BEARISH";
+  return "RANGING";
+}
+
+export function generateSignal(
+  ltfCandles: Candle[],
+  htfCandles: Candle[],
+  livePrice: number,
+  prev?: Signal | null
+): Signal {
+  const closes = ltfCandles.map((c) => c.close);
+  const htfCloses = htfCandles.map((c) => c.close);
+
+  const e9 = last(emaArr(closes, 9));
+  const e21 = last(emaArr(closes, 21));
+  const e50 = last(emaArr(closes, 50));
+  const r = rsiCalc(closes);
+  const m = macdCalc(closes);
+  const bb = boll(closes);
+  const a = atrCalc(ltfCandles);
   const price = livePrice;
 
-  const e9 = ema9[ema9.length - 1];
-  const e21 = ema21[ema21.length - 1];
-  const e50 = ema50[ema50.length - 1];
+  const ltfTrend = trendOf(closes);
+  const htfTrend = trendOf(htfCloses);
 
-  let bullScore = 0, bearScore = 0;
+  let bull = 0, bear = 0;
   const reasons: string[] = [];
 
-  if (e9 > e21 && e21 > e50) { bullScore += 25; reasons.push("EMA stack bullish (9>21>50)"); }
-  else if (e9 < e21 && e21 < e50) { bearScore += 25; reasons.push("EMA stack bearish (9<21<50)"); }
+  // HTF trend filter (heaviest weight — pro traders trade with HTF)
+  if (htfTrend === "BULLISH") { bull += 30; reasons.push("HTF trend bullish"); }
+  else if (htfTrend === "BEARISH") { bear += 30; reasons.push("HTF trend bearish"); }
+  else reasons.push("HTF ranging");
 
-  if (price > e50) { bullScore += 10; reasons.push("Price above EMA50"); }
-  else { bearScore += 10; reasons.push("Price below EMA50"); }
+  // LTF EMA structure
+  if (ltfTrend === "BULLISH") { bull += 18; reasons.push("LTF EMA stack bullish"); }
+  else if (ltfTrend === "BEARISH") { bear += 18; reasons.push("LTF EMA stack bearish"); }
 
-  if (r < 35) { bullScore += 18; reasons.push(`RSI oversold (${r.toFixed(1)})`); }
-  else if (r > 65) { bearScore += 18; reasons.push(`RSI overbought (${r.toFixed(1)})`); }
-  else if (r > 50) { bullScore += 6; }
-  else { bearScore += 6; }
+  // Price vs EMA50
+  if (price > e50) bull += 8;
+  else bear += 8;
 
-  if (m.hist > 0) { bullScore += 15; reasons.push("MACD histogram positive"); }
-  else { bearScore += 15; reasons.push("MACD histogram negative"); }
+  // RSI
+  if (r < 30) { bull += 18; reasons.push(`RSI deeply oversold (${r.toFixed(1)})`); }
+  else if (r < 45) { bull += 8; reasons.push(`RSI weak (${r.toFixed(1)})`); }
+  else if (r > 70) { bear += 18; reasons.push(`RSI deeply overbought (${r.toFixed(1)})`); }
+  else if (r > 55) { bear += 8; reasons.push(`RSI strong (${r.toFixed(1)})`); }
 
-  if (price < bb.lower) { bullScore += 15; reasons.push("Price below lower Bollinger band"); }
-  else if (price > bb.upper) { bearScore += 15; reasons.push("Price above upper Bollinger band"); }
+  // MACD with momentum check
+  if (m.hist > 0 && m.hist > m.prevHist) { bull += 15; reasons.push("MACD bullish & rising"); }
+  else if (m.hist > 0) { bull += 8; }
+  else if (m.hist < 0 && m.hist < m.prevHist) { bear += 15; reasons.push("MACD bearish & falling"); }
+  else { bear += 8; }
 
-  const lastClose = closes[closes.length - 1];
-  const mom = ((lastClose - closes[closes.length - 5]) / closes[closes.length - 5]) * 100;
-  if (mom > 0.3) { bullScore += 10; reasons.push(`Momentum +${mom.toFixed(2)}%`); }
-  else if (mom < -0.3) { bearScore += 10; reasons.push(`Momentum ${mom.toFixed(2)}%`); }
+  // Bollinger mean reversion
+  if (price < bb.lower) { bull += 12; reasons.push("Below lower Bollinger"); }
+  else if (price > bb.upper) { bear += 12; reasons.push("Above upper Bollinger"); }
 
-  const total = bullScore + bearScore;
-  let side: SignalSide = "NEUTRAL";
-  let confidence = 50;
-  if (bullScore > bearScore && bullScore - bearScore >= 12) {
-    side = "BUY";
-    confidence = Math.min(98, 55 + (bullScore - bearScore));
-  } else if (bearScore > bullScore && bearScore - bullScore >= 12) {
-    side = "SELL";
-    confidence = Math.min(98, 55 + (bearScore - bullScore));
-  } else {
-    side = bullScore >= bearScore ? "BUY" : "SELL";
-    confidence = 60 + Math.abs(bullScore - bearScore);
+  // Momentum (5-bar ROC)
+  const mom = ((closes[closes.length-1] - closes[closes.length-5]) / closes[closes.length-5]) * 100;
+  if (mom > 0.4) { bull += 9; reasons.push(`Momentum +${mom.toFixed(2)}%`); }
+  else if (mom < -0.4) { bear += 9; reasons.push(`Momentum ${mom.toFixed(2)}%`); }
+
+  // Determine raw side
+  const diff = bull - bear;
+  let side: SignalSide;
+  if (diff >= 18) side = "BUY";
+  else if (diff <= -18) side = "SELL";
+  else side = "NEUTRAL";
+
+  // STABILITY: don't flip on small reversals — require stronger opposing diff to flip
+  if (prev && prev.side !== "NEUTRAL" && side !== prev.side) {
+    const flipNeeded = 28; // require dominant reversal
+    if (Math.abs(diff) < flipNeeded) {
+      side = prev.side; // hold previous signal
+      reasons.push("Holding prior signal — reversal not confirmed");
+    }
   }
 
-  const trend: Signal["trend"] = e9 > e21 && e21 > e50 ? "BULLISH" : e9 < e21 && e21 < e50 ? "BEARISH" : "RANGING";
+  // If still neutral, surface dominant bias but mark low confidence
+  if (side === "NEUTRAL") {
+    side = bull >= bear ? "BUY" : "SELL";
+  }
 
-  // Risk model — ATR-based SL, multi-target TP
-  const slDist = a * 1.5;
-  const tp1Dist = a * 1.5;
-  const tp2Dist = a * 3;
-  const tp3Dist = a * 5;
+  const confidence = Math.max(40, Math.min(98, 50 + Math.abs(diff)));
 
+  // ATR risk (clamped so SL is meaningful but not crazy)
+  const atrSL = Math.max(a * 1.5, price * 0.003);
   const entry = price;
-  const stopLoss = side === "BUY" ? entry - slDist : entry + slDist;
-  const takeProfit1 = side === "BUY" ? entry + tp1Dist : entry - tp1Dist;
-  const takeProfit2 = side === "BUY" ? entry + tp2Dist : entry - tp2Dist;
-  const takeProfit3 = side === "BUY" ? entry + tp3Dist : entry - tp3Dist;
+  const stopLoss = side === "BUY" ? entry - atrSL : entry + atrSL;
+  const takeProfit1 = side === "BUY" ? entry + atrSL * 1.0 : entry - atrSL * 1.0;
+  const takeProfit2 = side === "BUY" ? entry + atrSL * 2.0 : entry - atrSL * 2.0;
+  const takeProfit3 = side === "BUY" ? entry + atrSL * 3.5 : entry - atrSL * 3.5;
   const rr = Math.abs(takeProfit2 - entry) / Math.abs(entry - stopLoss);
 
   return {
     side, entry, stopLoss, takeProfit1, takeProfit2, takeProfit3,
-    confidence, rr, reasons, rsi: r, trend, atr: a,
+    confidence, rr, reasons: reasons.slice(0, 8), rsi: r, trend: ltfTrend, htfTrend, atr: a,
+    bullScore: bull, bearScore: bear,
     generatedAt: Date.now(),
     validUntil: Date.now() + 15 * 60 * 1000,
   };
