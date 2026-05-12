@@ -1,94 +1,112 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Activity, TrendingUp, TrendingDown, Target, Shield, Clock, Zap, BarChart3, RefreshCw, Sparkles } from "lucide-react";
+import { Activity, TrendingUp, TrendingDown, Target, Shield, Clock, Zap, BarChart3, RefreshCw, Sparkles, Wifi, WifiOff } from "lucide-react";
 import { fetch24h, fetchKlines, fetchPrice } from "@/lib/binance";
 import { generateSignal, type Candle, type Signal } from "@/lib/signal-engine";
+import { PriceChart } from "./PriceChart";
 
 const TIMEFRAMES = [
-  { label: "5M", v: "5m" },
-  { label: "15M", v: "15m" },
-  { label: "1H", v: "1h" },
-  { label: "4H", v: "4h" },
+  { label: "5M", v: "5m", htf: "1h" },
+  { label: "15M", v: "15m", htf: "4h" },
+  { label: "1H", v: "1h", htf: "4h" },
+  { label: "4H", v: "4h", htf: "1d" },
 ];
 
 const fmt = (n: number, d = 2) => n.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
 
 export function SignalDashboard() {
-  const [tf, setTf] = useState("15m");
+  const [tfIdx, setTfIdx] = useState(1);
+  const tf = TIMEFRAMES[tfIdx];
   const [price, setPrice] = useState<number | null>(null);
   const [prevPrice, setPrevPrice] = useState<number | null>(null);
   const [candles, setCandles] = useState<Candle[]>([]);
+  const [htfCandles, setHtfCandles] = useState<Candle[]>([]);
   const [stats, setStats] = useState<{ change: number; changePercent: number; high: number; low: number; volume: number } | null>(null);
   const [signal, setSignal] = useState<Signal | null>(null);
+  const signalRef = useRef<Signal | null>(null);
   const [loading, setLoading] = useState(true);
   const [now, setNow] = useState(new Date());
   const [refreshing, setRefreshing] = useState(false);
+  const [online, setOnline] = useState(true);
 
-  // Live clock
+  useEffect(() => { signalRef.current = signal; }, [signal]);
+
   useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(t);
   }, []);
 
-  // Load candles when timeframe changes
+  // Load candles + HTF when timeframe changes
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
+    setSignal(null);
+    signalRef.current = null;
     (async () => {
       try {
-        const [k, p, s] = await Promise.all([fetchKlines("BTCUSDT", tf, 200), fetchPrice(), fetch24h()]);
+        const [k, htf, p, s] = await Promise.all([
+          fetchKlines("BTCUSDT", tf.v, 200),
+          fetchKlines("BTCUSDT", tf.htf, 200),
+          fetchPrice(),
+          fetch24h(),
+        ]);
         if (cancelled) return;
-        setCandles(k);
-        setPrice(p);
-        setStats(s);
-        setSignal(generateSignal(k, p));
-      } catch (e) { console.error(e); }
+        setCandles(k); setHtfCandles(htf); setPrice(p); setStats(s);
+        setSignal(generateSignal(k, htf, p, null));
+        setOnline(true);
+      } catch (e) { console.error(e); setOnline(false); }
       finally { if (!cancelled) setLoading(false); }
     })();
     return () => { cancelled = true; };
-  }, [tf]);
+  }, [tf.v, tf.htf]);
 
-  // Live price polling (every 3s)
+  // Live price polling every 3s
   useEffect(() => {
     const t = setInterval(async () => {
       try {
         const p = await fetchPrice();
         setPrevPrice((prev) => (price !== null ? price : prev));
         setPrice(p);
-      } catch {}
+        setOnline(true);
+      } catch { setOnline(false); }
     }, 3000);
     return () => clearInterval(t);
   }, [price]);
 
-  // Refresh signal every 30s using latest candles + live price
+  // Refresh signal every 45s with stability (passes prev signal)
   useEffect(() => {
-    if (candles.length === 0 || price === null) return;
+    if (candles.length === 0) return;
     const t = setInterval(async () => {
       try {
-        const k = await fetchKlines("BTCUSDT", tf, 200);
-        const p = await fetchPrice();
-        const s24 = await fetch24h();
-        setCandles(k);
-        setStats(s24);
-        setPrevPrice(price);
-        setPrice(p);
-        setSignal(generateSignal(k, p));
-      } catch {}
-    }, 30000);
+        const [k, htf, p, s24] = await Promise.all([
+          fetchKlines("BTCUSDT", tf.v, 200),
+          fetchKlines("BTCUSDT", tf.htf, 200),
+          fetchPrice(),
+          fetch24h(),
+        ]);
+        setCandles(k); setHtfCandles(htf); setStats(s24);
+        setPrevPrice(price); setPrice(p);
+        setSignal(generateSignal(k, htf, p, signalRef.current));
+        setOnline(true);
+      } catch { setOnline(false); }
+    }, 45000);
     return () => clearInterval(t);
-  }, [candles.length, price, tf]);
+  }, [candles.length, tf.v, tf.htf, price]);
 
   const refresh = async () => {
     setRefreshing(true);
     try {
-      const [k, p, s] = await Promise.all([fetchKlines("BTCUSDT", tf, 200), fetchPrice(), fetch24h()]);
-      setCandles(k);
-      setPrice(p);
-      setStats(s);
-      setSignal(generateSignal(k, p));
-    } finally {
-      setTimeout(() => setRefreshing(false), 600);
-    }
+      const [k, htf, p, s] = await Promise.all([
+        fetchKlines("BTCUSDT", tf.v, 200),
+        fetchKlines("BTCUSDT", tf.htf, 200),
+        fetchPrice(),
+        fetch24h(),
+      ]);
+      setCandles(k); setHtfCandles(htf); setPrice(p); setStats(s);
+      setSignal(generateSignal(k, htf, p, signalRef.current));
+      setOnline(true);
+    } catch { setOnline(false); }
+    finally { setTimeout(() => setRefreshing(false), 600); }
   };
 
   const priceDir = useMemo(() => {
@@ -97,10 +115,10 @@ export function SignalDashboard() {
   }, [price, prevPrice]);
 
   const isBuy = signal?.side === "BUY";
+  const sideColor = signal ? (isBuy ? "bull" : "bear") : "primary";
 
   return (
     <div className="min-h-screen grid-bg">
-      {/* Header */}
       <header className="sticky top-0 z-30 backdrop-blur-xl bg-background/70 border-b border-border">
         <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
           <motion.div initial={{ x: -20, opacity: 0 }} animate={{ x: 0, opacity: 1 }} className="flex items-center gap-3">
@@ -112,14 +130,20 @@ export function SignalDashboard() {
               <p className="text-[10px] text-muted-foreground uppercase tracking-wider">Pro Signal Engine</p>
             </div>
           </motion.div>
-          <div className="flex items-center gap-2 text-xs text-muted-foreground">
-            <Clock className="w-3 h-3" />
-            <span className="font-mono">{now.toLocaleTimeString()}</span>
+          <div className="flex items-center gap-3 text-xs text-muted-foreground">
+            <span className={`flex items-center gap-1 ${online ? "text-bull" : "text-bear"}`}>
+              {online ? <Wifi className="w-3 h-3" /> : <WifiOff className="w-3 h-3" />}
+              {online ? "LIVE" : "OFF"}
+            </span>
+            <span className="flex items-center gap-1">
+              <Clock className="w-3 h-3" />
+              <span className="font-mono">{now.toLocaleTimeString()}</span>
+            </span>
           </div>
         </div>
       </header>
 
-      <main className="max-w-6xl mx-auto px-4 py-6 space-y-6">
+      <main className="max-w-6xl mx-auto px-4 py-6 space-y-5">
         {/* Live Price */}
         <motion.section
           initial={{ y: 20, opacity: 0 }} animate={{ y: 0, opacity: 1 }}
@@ -129,11 +153,11 @@ export function SignalDashboard() {
           <div className="relative flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
             <div>
               <div className="flex items-center gap-2 text-xs text-muted-foreground uppercase tracking-wider mb-1">
-                <Activity className="w-3 h-3 text-bull animate-pulse" /> BTC / USDT • Live
+                <Activity className="w-3 h-3 text-bull animate-pulse" /> BTC / USDT • Binance Live
               </div>
               <AnimatePresence mode="wait">
                 <motion.div
-                  key={price}
+                  key={price ?? 0}
                   initial={{ y: 8, opacity: 0 }} animate={{ y: 0, opacity: 1 }} exit={{ y: -8, opacity: 0 }}
                   transition={{ duration: 0.2 }}
                   className={`text-4xl sm:text-5xl font-bold font-mono ${
@@ -150,7 +174,7 @@ export function SignalDashboard() {
                 </div>
               )}
             </div>
-            <div className="grid grid-cols-3 gap-3 text-xs">
+            <div className="grid grid-cols-3 gap-2 text-xs">
               <Stat label="24h High" value={stats ? `$${fmt(stats.high)}` : "—"} />
               <Stat label="24h Low" value={stats ? `$${fmt(stats.low)}` : "—"} />
               <Stat label="Volume" value={stats ? `${fmt(stats.volume, 0)}` : "—"} />
@@ -158,15 +182,20 @@ export function SignalDashboard() {
           </div>
         </motion.section>
 
+        {/* Live chart */}
+        {candles.length > 0 && price !== null && (
+          <PriceChart candles={candles} livePrice={price} side={signal?.side ?? "NEUTRAL"} />
+        )}
+
         {/* Timeframes */}
         <div className="flex items-center justify-between gap-2">
           <div className="flex gap-2">
-            {TIMEFRAMES.map((t) => (
+            {TIMEFRAMES.map((t, i) => (
               <button
                 key={t.v}
-                onClick={() => setTf(t.v)}
+                onClick={() => setTfIdx(i)}
                 className={`px-4 py-2 rounded-lg text-sm font-semibold transition-all active:scale-95 ${
-                  tf === t.v ? "bg-primary text-primary-foreground glow-pulse" : "bg-secondary hover:bg-accent hover:text-accent-foreground"
+                  tfIdx === i ? "bg-primary text-primary-foreground glow-pulse" : "bg-secondary hover:bg-accent hover:text-accent-foreground"
                 }`}
               >{t.label}</button>
             ))}
@@ -181,14 +210,14 @@ export function SignalDashboard() {
         </div>
 
         {/* Signal Card */}
-        {loading ? (
+        {loading || !signal ? (
           <div className="bg-card/80 rounded-2xl p-12 border border-border flex items-center justify-center">
             <RefreshCw className="w-8 h-8 animate-spin text-primary" />
           </div>
-        ) : signal && (
+        ) : (
           <AnimatePresence mode="wait">
             <motion.section
-              key={`${tf}-${signal.generatedAt}`}
+              key={signal.generatedAt}
               initial={{ opacity: 0, y: 20, scale: 0.98 }}
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, y: -10, scale: 0.98 }}
@@ -200,10 +229,11 @@ export function SignalDashboard() {
               <div className={`absolute inset-0 opacity-20 ${isBuy ? "bg-gradient-to-br from-bull to-transparent" : "bg-gradient-to-br from-bear to-transparent"}`} />
 
               <div className="relative space-y-5">
-                {/* Header */}
-                <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start justify-between gap-3 flex-wrap">
                   <div>
-                    <div className="text-xs text-muted-foreground uppercase tracking-wider mb-1">Live Signal • {tf.toUpperCase()}</div>
+                    <div className="text-xs text-muted-foreground uppercase tracking-wider mb-1">
+                      Signal • {tf.label} (HTF: {tf.htf.toUpperCase()})
+                    </div>
                     <motion.div
                       animate={{ scale: [1, 1.03, 1] }} transition={{ duration: 2, repeat: Infinity }}
                       className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl font-bold text-lg ${
@@ -221,7 +251,6 @@ export function SignalDashboard() {
                   </div>
                 </div>
 
-                {/* Confidence bar */}
                 <div className="h-2 bg-muted rounded-full overflow-hidden">
                   <motion.div
                     initial={{ width: 0 }} animate={{ width: `${signal.confidence}%` }}
@@ -230,8 +259,7 @@ export function SignalDashboard() {
                   />
                 </div>
 
-                {/* Levels */}
-                <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
                   <Level label="Entry" value={signal.entry} icon={<Target className="w-4 h-4" />} accent />
                   <Level label="Stop Loss" value={signal.stopLoss} icon={<Shield className="w-4 h-4" />} danger />
                   <Level label="TP 1" value={signal.takeProfit1} icon={<Sparkles className="w-4 h-4" />} bull />
@@ -239,23 +267,24 @@ export function SignalDashboard() {
                   <Level label="TP 3" value={signal.takeProfit3} icon={<Sparkles className="w-4 h-4" />} bull />
                 </div>
 
-                {/* Indicators */}
-                <div className="grid grid-cols-3 gap-3 text-xs">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
                   <Stat label="RSI(14)" value={signal.rsi.toFixed(1)} />
-                  <Stat label="Trend" value={signal.trend} />
+                  <Stat label="LTF Trend" value={signal.trend} />
+                  <Stat label="HTF Trend" value={signal.htfTrend} />
                   <Stat label="ATR" value={fmt(signal.atr)} />
                 </div>
 
-                {/* Reasons */}
                 <div>
                   <div className="text-xs text-muted-foreground uppercase tracking-wider mb-2 flex items-center gap-1">
                     <BarChart3 className="w-3 h-3" /> Strategy Confluence
+                    <span className="ml-auto font-mono text-bull">B:{signal.bullScore}</span>
+                    <span className="font-mono text-bear">S:{signal.bearScore}</span>
                   </div>
                   <div className="flex flex-wrap gap-2">
                     {signal.reasons.map((r, i) => (
                       <motion.span
                         key={i}
-                        initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.05 }}
+                        initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.04 }}
                         className="text-xs px-2.5 py-1 rounded-full bg-secondary border border-border"
                       >{r}</motion.span>
                     ))}
@@ -299,7 +328,7 @@ export function SignalDashboard() {
         </motion.div>
 
         <p className="text-[10px] text-center text-muted-foreground pb-4">
-          ⚠ For educational purposes. Trade at your own risk. Live data via Binance Public API.
+          ⚠ Educational purposes only. Live data via Binance Public API. Always manage your risk.
         </p>
       </main>
     </div>
@@ -310,7 +339,7 @@ function Stat({ label, value }: { label: string; value: string }) {
   return (
     <div className="bg-secondary/60 rounded-lg p-2.5 border border-border">
       <div className="text-[10px] text-muted-foreground uppercase tracking-wider">{label}</div>
-      <div className="font-mono font-semibold text-sm mt-0.5">{value}</div>
+      <div className="font-mono font-semibold text-sm mt-0.5 truncate">{value}</div>
     </div>
   );
 }
