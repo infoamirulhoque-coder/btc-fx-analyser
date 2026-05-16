@@ -1,7 +1,16 @@
-// Pro multi-timeframe confluence engine.
-// Stable signals: only flip when confluence strongly reverses; otherwise hold.
+// Multi-timeframe confluence engine.
+// Aggregates 5m, 15m, 30m, 1h, 2h, 4h votes into ONE final signal.
+// Signal is locked for 2 hours (resets only after that window).
 export type Candle = { openTime: number; open: number; high: number; low: number; close: number; volume: number };
 export type SignalSide = "BUY" | "SELL" | "NEUTRAL";
+
+export interface TFVote {
+  tf: string;
+  side: SignalSide;
+  score: number; // -100..100 (negative = bearish)
+  rsi: number;
+  trend: "BULLISH" | "BEARISH" | "RANGING";
+}
 
 export interface Signal {
   side: SignalSide;
@@ -21,6 +30,8 @@ export interface Signal {
   generatedAt: number;
   bullScore: number;
   bearScore: number;
+  votes: TFVote[];
+  alignment: number; // 0..100 % of TFs agreeing
 }
 
 const emaArr = (values: number[], period: number): number[] => {
@@ -75,7 +86,7 @@ const boll = (closes: number[], period = 20, mult = 2) => {
   const slice = closes.slice(-period);
   const mean = slice.reduce((a, b) => a + b, 0) / period;
   const sd = Math.sqrt(slice.reduce((a, b) => a + (b - mean) ** 2, 0) / period);
-  return { mid: mean, upper: mean + mult * sd, lower: mean - mult * sd, width: (mult * 2 * sd) / mean };
+  return { mid: mean, upper: mean + mult * sd, lower: mean - mult * sd };
 };
 
 function trendOf(closes: number[]): "BULLISH" | "BEARISH" | "RANGING" {
@@ -87,101 +98,120 @@ function trendOf(closes: number[]): "BULLISH" | "BEARISH" | "RANGING" {
   return "RANGING";
 }
 
-export function generateSignal(
-  ltfCandles: Candle[],
-  htfCandles: Candle[],
-  livePrice: number,
-  prev?: Signal | null
-): Signal {
-  const closes = ltfCandles.map((c) => c.close);
-  const htfCloses = htfCandles.map((c) => c.close);
-
-  const e9 = last(emaArr(closes, 9));
-  const e21 = last(emaArr(closes, 21));
-  const e50 = last(emaArr(closes, 50));
+// Score a single timeframe: returns net score in -100..100
+function scoreTF(candles: Candle[], price: number): { score: number; rsi: number; trend: "BULLISH" | "BEARISH" | "RANGING" } {
+  const closes = candles.map((c) => c.close);
+  const t = trendOf(closes);
   const r = rsiCalc(closes);
   const m = macdCalc(closes);
   const bb = boll(closes);
-  const a = atrCalc(ltfCandles);
-  const price = livePrice;
-
-  const ltfTrend = trendOf(closes);
-  const htfTrend = trendOf(htfCloses);
+  const e50 = last(emaArr(closes, 50));
 
   let bull = 0, bear = 0;
-  const reasons: string[] = [];
+  if (t === "BULLISH") bull += 25;
+  else if (t === "BEARISH") bear += 25;
 
-  // HTF trend filter (heaviest weight — pro traders trade with HTF)
-  if (htfTrend === "BULLISH") { bull += 30; reasons.push("HTF trend bullish"); }
-  else if (htfTrend === "BEARISH") { bear += 30; reasons.push("HTF trend bearish"); }
-  else reasons.push("HTF ranging");
+  if (price > e50) bull += 10; else bear += 10;
 
-  // LTF EMA structure
-  if (ltfTrend === "BULLISH") { bull += 18; reasons.push("LTF EMA stack bullish"); }
-  else if (ltfTrend === "BEARISH") { bear += 18; reasons.push("LTF EMA stack bearish"); }
+  if (r < 30) bull += 20;
+  else if (r < 45) bull += 8;
+  else if (r > 70) bear += 20;
+  else if (r > 55) bear += 8;
 
-  // Price vs EMA50
-  if (price > e50) bull += 8;
+  if (m.hist > 0 && m.hist > m.prevHist) bull += 18;
+  else if (m.hist > 0) bull += 8;
+  else if (m.hist < 0 && m.hist < m.prevHist) bear += 18;
   else bear += 8;
 
-  // RSI
-  if (r < 30) { bull += 18; reasons.push(`RSI deeply oversold (${r.toFixed(1)})`); }
-  else if (r < 45) { bull += 8; reasons.push(`RSI weak (${r.toFixed(1)})`); }
-  else if (r > 70) { bear += 18; reasons.push(`RSI deeply overbought (${r.toFixed(1)})`); }
-  else if (r > 55) { bear += 8; reasons.push(`RSI strong (${r.toFixed(1)})`); }
+  if (price < bb.lower) bull += 12;
+  else if (price > bb.upper) bear += 12;
 
-  // MACD with momentum check
-  if (m.hist > 0 && m.hist > m.prevHist) { bull += 15; reasons.push("MACD bullish & rising"); }
-  else if (m.hist > 0) { bull += 8; }
-  else if (m.hist < 0 && m.hist < m.prevHist) { bear += 15; reasons.push("MACD bearish & falling"); }
-  else { bear += 8; }
-
-  // Bollinger mean reversion
-  if (price < bb.lower) { bull += 12; reasons.push("Below lower Bollinger"); }
-  else if (price > bb.upper) { bear += 12; reasons.push("Above upper Bollinger"); }
-
-  // Momentum (5-bar ROC)
-  const mom = ((closes[closes.length-1] - closes[closes.length-5]) / closes[closes.length-5]) * 100;
-  if (mom > 0.4) { bull += 9; reasons.push(`Momentum +${mom.toFixed(2)}%`); }
-  else if (mom < -0.4) { bear += 9; reasons.push(`Momentum ${mom.toFixed(2)}%`); }
-
-  // Determine raw side
-  const diff = bull - bear;
-  let side: SignalSide;
-  if (diff >= 18) side = "BUY";
-  else if (diff <= -18) side = "SELL";
-  else side = "NEUTRAL";
-
-  // STABILITY: don't flip on small reversals — require stronger opposing diff to flip
-  if (prev && prev.side !== "NEUTRAL" && side !== prev.side) {
-    const flipNeeded = 28; // require dominant reversal
-    if (Math.abs(diff) < flipNeeded) {
-      side = prev.side; // hold previous signal
-      reasons.push("Holding prior signal — reversal not confirmed");
-    }
+  if (closes.length >= 6) {
+    const mom = ((closes[closes.length-1] - closes[closes.length-5]) / closes[closes.length-5]) * 100;
+    if (mom > 0.4) bull += 10;
+    else if (mom < -0.4) bear += 10;
   }
 
-  // If still neutral, surface dominant bias but mark low confidence
-  if (side === "NEUTRAL") {
-    side = bull >= bear ? "BUY" : "SELL";
+  const total = bull + bear || 1;
+  const score = ((bull - bear) / total) * 100;
+  return { score, rsi: r, trend: t };
+}
+
+export interface MTFInput {
+  tf: string;
+  weight: number;
+  candles: Candle[];
+}
+
+export function generateSignal(
+  inputs: MTFInput[],
+  livePrice: number,
+  prev?: Signal | null
+): Signal {
+  // The signal is locked for 2 hours from generatedAt.
+  if (prev && Date.now() < prev.validUntil) {
+    // Refresh entry/SL/TP only if live price drifts significantly? Keep stable — return prev with updated entry display.
+    return prev;
   }
 
-  const confidence = Math.max(40, Math.min(98, 50 + Math.abs(diff)));
+  const votes: TFVote[] = [];
+  let weightedScore = 0;
+  let totalWeight = 0;
+  let bullCount = 0, bearCount = 0;
 
-  // ATR risk (clamped so SL is meaningful but not crazy)
-  const atrSL = Math.max(a * 1.5, price * 0.003);
-  const entry = price;
+  for (const input of inputs) {
+    if (input.candles.length < 50) continue;
+    const r = scoreTF(input.candles, livePrice);
+    const side: SignalSide = r.score > 12 ? "BUY" : r.score < -12 ? "SELL" : "NEUTRAL";
+    votes.push({ tf: input.tf, side, score: Math.round(r.score), rsi: r.rsi, trend: r.trend });
+    weightedScore += r.score * input.weight;
+    totalWeight += input.weight;
+    if (side === "BUY") bullCount++;
+    else if (side === "SELL") bearCount++;
+  }
+
+  const finalScore = totalWeight ? weightedScore / totalWeight : 0;
+  let side: SignalSide = finalScore > 8 ? "BUY" : finalScore < -8 ? "SELL" : (finalScore >= 0 ? "BUY" : "SELL");
+
+  const reasons: string[] = [];
+  reasons.push(`MTF aggregate score: ${finalScore.toFixed(1)}`);
+  reasons.push(`${bullCount} TFs bullish vs ${bearCount} bearish`);
+  votes.forEach((v) => reasons.push(`${v.tf}: ${v.side} (${v.score})`));
+
+  const alignment = votes.length ? Math.round((Math.max(bullCount, bearCount) / votes.length) * 100) : 0;
+  const confidence = Math.max(55, Math.min(98, 55 + Math.abs(finalScore) * 0.45 + alignment * 0.15));
+
+  // Use the 1h candles for ATR/structure if available, else first valid input
+  const refInput = inputs.find((i) => i.tf === "1h" && i.candles.length >= 50) ?? inputs.find((i) => i.candles.length >= 50)!;
+  const refCandles = refInput.candles;
+  const a = atrCalc(refCandles);
+  const refTrend = trendOf(refCandles.map((c) => c.close));
+
+  const htfInput = inputs.find((i) => i.tf === "4h" && i.candles.length >= 50) ?? refInput;
+  const htfTrend = trendOf(htfInput.candles.map((c) => c.close));
+
+  const atrSL = Math.max(a * 1.6, livePrice * 0.004);
+  const entry = livePrice;
   const stopLoss = side === "BUY" ? entry - atrSL : entry + atrSL;
   const takeProfit1 = side === "BUY" ? entry + atrSL * 1.0 : entry - atrSL * 1.0;
   const takeProfit2 = side === "BUY" ? entry + atrSL * 2.0 : entry - atrSL * 2.0;
   const takeProfit3 = side === "BUY" ? entry + atrSL * 3.5 : entry - atrSL * 3.5;
   const rr = Math.abs(takeProfit2 - entry) / Math.abs(entry - stopLoss);
 
+  const now = Date.now();
   return {
     side, entry, stopLoss, takeProfit1, takeProfit2, takeProfit3,
-    confidence, rr, reasons: reasons.slice(0, 8), rsi: r, trend: ltfTrend, htfTrend, atr: a,
-    bullScore: bull, bearScore: bear,
-    generatedAt: Date.now(),
-    validUntil: Date.now() + 15 * 60 * 1000,
+    confidence, rr,
+    reasons: reasons.slice(0, 12),
+    rsi: votes.find((v) => v.tf === "1h")?.rsi ?? votes[0]?.rsi ?? 50,
+    trend: refTrend,
+    htfTrend,
+    atr: a,
+    bullScore: Math.round(50 + finalScore / 2),
+    bearScore: Math.round(50 - finalScore / 2),
+    votes,
+    alignment,
+    generatedAt: now,
+    validUntil: now + 2 * 60 * 60 * 1000, // 2 hours lock
   };
 }
