@@ -1,26 +1,26 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Activity, TrendingUp, TrendingDown, Target, Shield, Clock, Zap, BarChart3, RefreshCw, Sparkles, Wifi, WifiOff } from "lucide-react";
+import { Activity, TrendingUp, TrendingDown, Target, Shield, Clock, Zap, BarChart3, RefreshCw, Sparkles, Wifi, WifiOff, Layers } from "lucide-react";
 import { fetch24h, fetchKlines, fetchPrice } from "@/lib/binance";
-import { generateSignal, type Candle, type Signal } from "@/lib/signal-engine";
+import { generateSignal, type Candle, type Signal, type MTFInput } from "@/lib/signal-engine";
 import { PriceChart } from "./PriceChart";
 
-const TIMEFRAMES = [
-  { label: "5M", v: "5m", htf: "1h" },
-  { label: "15M", v: "15m", htf: "4h" },
-  { label: "1H", v: "1h", htf: "4h" },
-  { label: "4H", v: "4h", htf: "1d" },
+// Multi-timeframe set with weights (higher TF = more weight)
+const MTF = [
+  { tf: "5m", weight: 1 },
+  { tf: "15m", weight: 1.3 },
+  { tf: "30m", weight: 1.6 },
+  { tf: "1h", weight: 2.0 },
+  { tf: "2h", weight: 2.4 },
+  { tf: "4h", weight: 2.8 },
 ];
 
 const fmt = (n: number, d = 2) => n.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
 
 export function SignalDashboard() {
-  const [tfIdx, setTfIdx] = useState(1);
-  const tf = TIMEFRAMES[tfIdx];
   const [price, setPrice] = useState<number | null>(null);
   const [prevPrice, setPrevPrice] = useState<number | null>(null);
-  const [candles, setCandles] = useState<Candle[]>([]);
-  const [htfCandles, setHtfCandles] = useState<Candle[]>([]);
+  const [chartCandles, setChartCandles] = useState<Candle[]>([]);
   const [stats, setStats] = useState<{ change: number; changePercent: number; high: number; low: number; volume: number } | null>(null);
   const [signal, setSignal] = useState<Signal | null>(null);
   const signalRef = useRef<Signal | null>(null);
@@ -36,36 +36,42 @@ export function SignalDashboard() {
     return () => clearInterval(t);
   }, []);
 
-  // Load candles + HTF when timeframe changes
+  const loadAll = async (force = false) => {
+    try {
+      const [klinesArr, p, s] = await Promise.all([
+        Promise.all(MTF.map((m) => fetchKlines("BTCUSDT", m.tf, 200))),
+        fetchPrice(),
+        fetch24h(),
+      ]);
+      const inputs: MTFInput[] = MTF.map((m, i) => ({ tf: m.tf, weight: m.weight, candles: klinesArr[i] }));
+      // chart uses 1h candles
+      const oneH = inputs.find((i) => i.tf === "1h")?.candles ?? klinesArr[0];
+      setChartCandles(oneH);
+      setPrevPrice(price);
+      setPrice(p);
+      setStats(s);
+      const next = generateSignal(inputs, p, force ? null : signalRef.current);
+      setSignal(next);
+      setOnline(true);
+    } catch (e) {
+      console.error(e);
+      setOnline(false);
+    }
+  };
+
+  // Initial load
   useEffect(() => {
-    let cancelled = false;
     setLoading(true);
-    setSignal(null);
-    signalRef.current = null;
-    (async () => {
-      try {
-        const [k, htf, p, s] = await Promise.all([
-          fetchKlines("BTCUSDT", tf.v, 200),
-          fetchKlines("BTCUSDT", tf.htf, 200),
-          fetchPrice(),
-          fetch24h(),
-        ]);
-        if (cancelled) return;
-        setCandles(k); setHtfCandles(htf); setPrice(p); setStats(s);
-        setSignal(generateSignal(k, htf, p, null));
-        setOnline(true);
-      } catch (e) { console.error(e); setOnline(false); }
-      finally { if (!cancelled) setLoading(false); }
-    })();
-    return () => { cancelled = true; };
-  }, [tf.v, tf.htf]);
+    loadAll(true).finally(() => setLoading(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Live price polling every 3s
   useEffect(() => {
     const t = setInterval(async () => {
       try {
         const p = await fetchPrice();
-        setPrevPrice((prev) => (price !== null ? price : prev));
+        setPrevPrice(price);
         setPrice(p);
         setOnline(true);
       } catch { setOnline(false); }
@@ -73,40 +79,17 @@ export function SignalDashboard() {
     return () => clearInterval(t);
   }, [price]);
 
-  // Refresh signal every 45s with stability (passes prev signal)
+  // Re-evaluate signal every 60s — generateSignal will hold current signal until 2h expiry
   useEffect(() => {
-    if (candles.length === 0) return;
-    const t = setInterval(async () => {
-      try {
-        const [k, htf, p, s24] = await Promise.all([
-          fetchKlines("BTCUSDT", tf.v, 200),
-          fetchKlines("BTCUSDT", tf.htf, 200),
-          fetchPrice(),
-          fetch24h(),
-        ]);
-        setCandles(k); setHtfCandles(htf); setStats(s24);
-        setPrevPrice(price); setPrice(p);
-        setSignal(generateSignal(k, htf, p, signalRef.current));
-        setOnline(true);
-      } catch { setOnline(false); }
-    }, 45000);
+    const t = setInterval(() => loadAll(false), 60000);
     return () => clearInterval(t);
-  }, [candles.length, tf.v, tf.htf, price]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const refresh = async () => {
     setRefreshing(true);
-    try {
-      const [k, htf, p, s] = await Promise.all([
-        fetchKlines("BTCUSDT", tf.v, 200),
-        fetchKlines("BTCUSDT", tf.htf, 200),
-        fetchPrice(),
-        fetch24h(),
-      ]);
-      setCandles(k); setHtfCandles(htf); setPrice(p); setStats(s);
-      setSignal(generateSignal(k, htf, p, signalRef.current));
-      setOnline(true);
-    } catch { setOnline(false); }
-    finally { setTimeout(() => setRefreshing(false), 600); }
+    await loadAll(false);
+    setTimeout(() => setRefreshing(false), 600);
   };
 
   const priceDir = useMemo(() => {
@@ -114,8 +97,23 @@ export function SignalDashboard() {
     return price > prevPrice ? "up" : price < prevPrice ? "down" : "flat";
   }, [price, prevPrice]);
 
+  // Countdown to next signal reset
+  const [timeLeft, setTimeLeft] = useState("");
+  useEffect(() => {
+    if (!signal) return;
+    const update = () => {
+      const ms = Math.max(0, signal.validUntil - Date.now());
+      const h = Math.floor(ms / 3600000);
+      const m = Math.floor((ms % 3600000) / 60000);
+      const s = Math.floor((ms % 60000) / 1000);
+      setTimeLeft(`${h.toString().padStart(2,"0")}:${m.toString().padStart(2,"0")}:${s.toString().padStart(2,"0")}`);
+    };
+    update();
+    const t = setInterval(update, 1000);
+    return () => clearInterval(t);
+  }, [signal]);
+
   const isBuy = signal?.side === "BUY";
-  const sideColor = signal ? (isBuy ? "bull" : "bear") : "primary";
 
   return (
     <div className="min-h-screen grid-bg">
@@ -127,7 +125,7 @@ export function SignalDashboard() {
             </div>
             <div>
               <h1 className="text-lg font-bold glow-text leading-tight">BTC-FX-Analyser</h1>
-              <p className="text-[10px] text-muted-foreground uppercase tracking-wider">Pro Signal Engine</p>
+              <p className="text-[10px] text-muted-foreground uppercase tracking-wider">MTF Pro Signal Engine</p>
             </div>
           </motion.div>
           <div className="flex items-center gap-3 text-xs text-muted-foreground">
@@ -183,30 +181,30 @@ export function SignalDashboard() {
         </motion.section>
 
         {/* Live chart */}
-        {candles.length > 0 && price !== null && (
-          <PriceChart candles={candles} livePrice={price} side={signal?.side ?? "NEUTRAL"} />
+        {chartCandles.length > 0 && price !== null && (
+          <PriceChart candles={chartCandles} livePrice={price} side={signal?.side ?? "NEUTRAL"} />
         )}
 
-        {/* Timeframes */}
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex gap-2">
-            {TIMEFRAMES.map((t, i) => (
-              <button
-                key={t.v}
-                onClick={() => setTfIdx(i)}
-                className={`px-4 py-2 rounded-lg text-sm font-semibold transition-all active:scale-95 ${
-                  tfIdx === i ? "bg-primary text-primary-foreground glow-pulse" : "bg-secondary hover:bg-accent hover:text-accent-foreground"
-                }`}
-              >{t.label}</button>
-            ))}
+        {/* MTF info bar */}
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <Layers className="w-4 h-4 text-primary" />
+            <span className="uppercase tracking-wider">Analyzing: 5M · 15M · 30M · 1H · 2H · 4H</span>
           </div>
-          <button
-            onClick={refresh}
-            className="p-2 rounded-lg bg-secondary hover:bg-accent hover:text-accent-foreground transition-all active:scale-95"
-            aria-label="Refresh"
-          >
-            <RefreshCw className={`w-4 h-4 ${refreshing ? "animate-spin" : ""}`} />
-          </button>
+          <div className="flex items-center gap-2">
+            {signal && (
+              <span className="text-xs font-mono px-3 py-1.5 rounded-lg bg-secondary border border-border">
+                Resets in <span className="text-primary font-bold">{timeLeft}</span>
+              </span>
+            )}
+            <button
+              onClick={refresh}
+              className="p-2 rounded-lg bg-secondary hover:bg-accent hover:text-accent-foreground transition-all active:scale-95"
+              aria-label="Refresh"
+            >
+              <RefreshCw className={`w-4 h-4 ${refreshing ? "animate-spin" : ""}`} />
+            </button>
+          </div>
         </div>
 
         {/* Signal Card */}
@@ -232,7 +230,7 @@ export function SignalDashboard() {
                 <div className="flex items-start justify-between gap-3 flex-wrap">
                   <div>
                     <div className="text-xs text-muted-foreground uppercase tracking-wider mb-1">
-                      Signal • {tf.label} (HTF: {tf.htf.toUpperCase()})
+                      Final MTF Signal • Locked 2H
                     </div>
                     <motion.div
                       animate={{ scale: [1, 1.03, 1] }} transition={{ duration: 2, repeat: Infinity }}
@@ -247,7 +245,7 @@ export function SignalDashboard() {
                   <div className="text-right">
                     <div className="text-xs text-muted-foreground uppercase">Confidence</div>
                     <div className="text-2xl font-bold glow-text">{signal.confidence.toFixed(0)}%</div>
-                    <div className="text-xs text-muted-foreground">RR 1:{signal.rr.toFixed(2)}</div>
+                    <div className="text-xs text-muted-foreground">RR 1:{signal.rr.toFixed(2)} · Align {signal.alignment}%</div>
                   </div>
                 </div>
 
@@ -267,9 +265,33 @@ export function SignalDashboard() {
                   <Level label="TP 3" value={signal.takeProfit3} icon={<Sparkles className="w-4 h-4" />} bull />
                 </div>
 
+                {/* MTF vote breakdown */}
+                <div>
+                  <div className="text-xs text-muted-foreground uppercase tracking-wider mb-2 flex items-center gap-1">
+                    <Layers className="w-3 h-3" /> Timeframe Votes
+                  </div>
+                  <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+                    {signal.votes.map((v) => (
+                      <motion.div
+                        key={v.tf}
+                        initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }}
+                        className={`rounded-lg p-2 border text-center ${
+                          v.side === "BUY" ? "border-bull/50 bg-bull/10 text-bull" :
+                          v.side === "SELL" ? "border-bear/50 bg-bear/10 text-bear" :
+                          "border-border bg-secondary/40"
+                        }`}
+                      >
+                        <div className="text-[10px] uppercase opacity-70">{v.tf}</div>
+                        <div className="font-bold text-sm">{v.side}</div>
+                        <div className="text-[10px] font-mono opacity-80">{v.score > 0 ? "+" : ""}{v.score}</div>
+                      </motion.div>
+                    ))}
+                  </div>
+                </div>
+
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
-                  <Stat label="RSI(14)" value={signal.rsi.toFixed(1)} />
-                  <Stat label="LTF Trend" value={signal.trend} />
+                  <Stat label="RSI(1H)" value={signal.rsi.toFixed(1)} />
+                  <Stat label="1H Trend" value={signal.trend} />
                   <Stat label="HTF Trend" value={signal.htfTrend} />
                   <Stat label="ATR" value={fmt(signal.atr)} />
                 </div>
@@ -277,8 +299,6 @@ export function SignalDashboard() {
                 <div>
                   <div className="text-xs text-muted-foreground uppercase tracking-wider mb-2 flex items-center gap-1">
                     <BarChart3 className="w-3 h-3" /> Strategy Confluence
-                    <span className="ml-auto font-mono text-bull">B:{signal.bullScore}</span>
-                    <span className="font-mono text-bear">S:{signal.bearScore}</span>
                   </div>
                   <div className="flex flex-wrap gap-2">
                     {signal.reasons.map((r, i) => (
@@ -293,7 +313,7 @@ export function SignalDashboard() {
 
                 <div className="flex items-center justify-between text-[10px] text-muted-foreground pt-2 border-t border-border">
                   <span>Generated {new Date(signal.generatedAt).toLocaleTimeString()}</span>
-                  <span>Valid until {new Date(signal.validUntil).toLocaleTimeString()}</span>
+                  <span>Resets {new Date(signal.validUntil).toLocaleTimeString()}</span>
                 </div>
               </div>
             </motion.section>
