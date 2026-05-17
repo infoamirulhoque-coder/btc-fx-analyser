@@ -3,7 +3,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Activity, TrendingUp, TrendingDown, Target, Shield, Clock, Zap, BarChart3, RefreshCw, Sparkles, Wifi, WifiOff, Layers, ChevronDown } from "lucide-react";
 import { fetch24h, fetchKlines, fetchPrice } from "@/lib/binance";
 import { generateSignal, type Candle, type Signal, type MTFInput } from "@/lib/signal-engine";
-import { PriceChart } from "./PriceChart";
+import { TradingViewChart } from "./TradingViewChart";
 import devImage from "@/assets/developer-amirul.jpg";
 
 const MTF = [
@@ -241,9 +241,7 @@ export function SignalDashboard() {
             </div>
           </motion.section>
 
-          {chartCandles.length > 0 && price !== null && (
-            <PriceChart candles={chartCandles} livePrice={price} side={signal?.side ?? "NEUTRAL"} />
-          )}
+          <TradingViewChart symbol={pair.symbol} interval="5" height={460} />
 
           <div className="flex items-center justify-between gap-2 flex-wrap">
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
