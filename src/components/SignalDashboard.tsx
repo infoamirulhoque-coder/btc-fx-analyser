@@ -241,9 +241,7 @@ export function SignalDashboard() {
             </div>
           </motion.section>
 
-          {chartCandles.length > 0 && price !== null && (
-            <PriceChart candles={chartCandles} livePrice={price} side={signal?.side ?? "NEUTRAL"} />
-          )}
+          <TradingViewChart symbol={pair.symbol} interval="5" height={460} />
 
           <div className="flex items-center justify-between gap-2 flex-wrap">
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
